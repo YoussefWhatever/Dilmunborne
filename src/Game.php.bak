@@ -1,0 +1,410 @@
+<?php
+namespace Game;
+
+use Game\Util;
+
+class Game {
+    private DB $db;
+    public array $state;
+
+    public function __construct(DB $db) {
+        $this->db = $db;
+        $this->db->ensureMetaTables();
+        if (!isset($_SESSION['game'])) {
+            $this->newGame();
+        } else {
+            $this->state = $_SESSION['game'];
+        }
+    }
+
+    private function randName(): string {
+        // Pulls a random user from USERS to name your chef
+        try {
+            $row = $this->db->pdo->query("SELECT first_name, last_name FROM USERS ORDER BY RANDOM() LIMIT 1")->fetch(\PDO::FETCH_ASSOC);
+            if ($row && $row['first_name']) {
+                return $row['first_name'] . ' ' . $row['last_name'];
+            }
+        } catch (\Throwable $e) {}
+        $names = ['Alex', 'Sam', 'Riley', 'Jordan', 'Taylor', 'Morgan', 'Quinn', 'Charlie'];
+        return Util::pick($names) . ' ' . Util::pick(['Flambe', 'Sous', 'Knifehands', 'Pepper']);
+    }
+
+    public function newGame(): void {
+        $start = $this->getRandomActiveRestaurant();
+        $this->state = [
+            'player' => [
+                'name' => $this->randName(),
+                'hp' => 10,
+                'max_hp' => 10,
+                'hunger' => 0,
+                'max_hunger' => 10,
+                'sanity' => 8,
+                'max_sanity' => 12,
+                'sauce_shards' => 0,
+                'inventory' => [],
+            ],
+            'pos' => $start ? $start['id'] : null,
+            'visited' => $start ? [$start['id']] : [],
+            'depth' => 1,
+            'log' => ["You wake in a neon-lit alley. A whisper: \"Where is the Lamb Sauce?\""],
+            'fog' => [],
+        ];
+        if ($start) $this->state['log'][] = "You smell " . $start['cuisine_type'] . " from " . $start['name'] . ".";
+        $_SESSION['game'] = $this->state;
+    }
+
+    public function save(): void {
+        $_SESSION['game'] = $this->state;
+    }
+
+    private function getRandomActiveRestaurant(): ?array {
+        try {
+            $stmt = $this->db->pdo->query("SELECT id, name, cuisine_type, city, rating
+                                           FROM RESTAURANTS
+                                           WHERE IFNULL(is_active,1)=1
+                                           ORDER BY RANDOM() LIMIT 1");
+            $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+            return $row ?: null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    private function getRestaurantById(int $id): ?array {
+        $stmt = $this->db->pdo->prepare("SELECT id, name, cuisine_type, city, rating FROM RESTAURANTS WHERE id = :id");
+        $stmt->execute([':id'=>$id]);
+        $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+        return $row ?: null;
+    }
+
+    private function neighborsOf(int $rid): array {
+        // Nearby restaurants inferred by shared city or cuisine, or review cross-links.
+        $r = $this->getRestaurantById($rid);
+        if (!$r) return [];
+        $neighbors = [];
+
+        // Prefer same city
+        $stmt = $this->db->pdo->prepare("SELECT id, name, cuisine_type, city, rating
+                                         FROM RESTAURANTS
+                                         WHERE city = :city AND id != :id
+                                         ORDER BY RANDOM() LIMIT 4");
+        $stmt->execute([':city'=>$r['city'] ?? '', ':id'=>$rid]);
+        $neighbors = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+
+        if (count($neighbors) < 2) {
+            // fallback: shared cuisine
+            $stmt = $this->db->pdo->prepare("SELECT id, name, cuisine_type, city, rating
+                                             FROM RESTAURANTS
+                                             WHERE cuisine_type = :cui AND id != :id
+                                             ORDER BY RANDOM() LIMIT 4");
+            $stmt->execute([':cui'=>$r['cuisine_type'] ?? '', ':id'=>$rid]);
+            $more = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+            $neighbors = array_merge($neighbors, $more);
+        }
+        return array_slice($neighbors, 0, 4);
+    }
+
+    private function moodOfRestaurant(int $rid): array {
+        // Derive an "emotion aura" from REVIEWS
+        $stmt = $this->db->pdo->prepare("SELECT AVG(rating) as avg_rating, COUNT(*) as cnt FROM REVIEWS WHERE restaurant_id = :rid");
+        $stmt->execute([':rid'=>$rid]);
+        $row = $stmt->fetch(\PDO::FETCH_ASSOC) ?: ['avg_rating'=>null, 'cnt'=>0];
+        $avg = (float)($row['avg_rating'] ?? 0);
+        $cnt = (int)($row['cnt'] ?? 0);
+        $emotion = 'Neutral Craving';
+        $effect = 0;
+        if ($cnt > 0) {
+            if ($avg >= 4.5) { $emotion = 'Elation'; $effect = 2; }
+            elseif ($avg >= 3.5) { $emotion = 'Comfort'; $effect = 1; }
+            elseif ($avg >= 2.5) { $emotion = 'Melancholy'; $effect = -1; }
+            else { $emotion = 'Rage of the Hangry'; $effect = -2; }
+        }
+        return ['name'=>$emotion, 'power'=>$effect, 'samples'=>$cnt];
+    }
+
+    private function menuItemsAt(int $rid): array {
+        // Flexible fetch in case columns differ
+        $cols = $this->db->columnList('MENU_ITEMS');
+        $selectable = array_intersect($cols, ['id','name','title','item_name','description','price','restaurant_id','is_vegetarian','is_spicy','calories']);
+        $sel = implode(',', $selectable ?: ['id']);
+        $stmt = $this->db->pdo->prepare("SELECT $sel FROM MENU_ITEMS WHERE restaurant_id = :rid");
+        $stmt->execute([':rid'=>$rid]);
+        $items = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+        // Normalize fields
+        foreach ($items as &$it) {
+            $it['display_name'] = $it['name'] ?? ($it['title'] ?? ($it['item_name'] ?? ('Item#'.$it['id'])));
+            $it['price'] = isset($it['price']) ? (float)$it['price'] : null;
+        }
+        return $items;
+    }
+
+    private function dangerFromOrders(int $rid): int {
+        // Higher traffic => more danger. Try to infer from ORDERS + ORDER_ITEMS
+        $sql = null;
+        if ($this->db->hasColumn('ORDERS','restaurant_id')) {
+            $sql = "SELECT COUNT(*) FROM ORDERS WHERE restaurant_id = :rid";
+            $stmt = $this->db->pdo->prepare($sql);
+            $stmt->execute([':rid'=>$rid]);
+            $cnt = (int)$stmt->fetchColumn();
+        } else {
+            // infer via joins
+            $cnt = 0;
+            try {
+                $sql = "SELECT COUNT(DISTINCT o.id)
+                        FROM ORDERS o
+                        JOIN ORDER_ITEMS oi ON oi.order_id = o.id
+                        JOIN MENU_ITEMS mi ON mi.id = oi.menu_item_id
+                        WHERE mi.restaurant_id = :rid";
+                $stmt = $this->db->pdo->prepare($sql);
+                $stmt->execute([':rid'=>$rid]);
+                $cnt = (int)$stmt->fetchColumn();
+            } catch (\Throwable $e) {}
+        }
+        return max(1, (int)ceil(sqrt(max(0,$cnt))));
+    }
+
+    public function renderMap(): string {
+        $rid = $this->state['pos'];
+        if (!$rid) return "[No map data]";
+        $neighbors = $this->neighborsOf($rid);
+        $center = $this->getRestaurantById($rid);
+        $lines = [];
+        $lines[] = "+-------------------- CITY HEATMAP ---------------------+";
+        $lines[] = "| " . str_pad(($center['city'] ?? 'Unknown City'), 54) . " |";
+        $lines[] = "+-------------------------------------------------------+";
+        $lines[] = " You are at: " . ($center['name'] ?? '???') . " [" . ($center['cuisine_type'] ?? '?') . "]";
+        $mood = $this->moodOfRestaurant($rid);
+        $lines[] = " Emotion aura: {$mood['name']} (samples: {$mood['samples']})";
+        $lines[] = " Danger level: " . $this->dangerFromOrders($rid);
+        $lines[] = "";
+        $lines[] = " Paths:";
+        $dirs = ['north','east','south','west'];
+        foreach ($neighbors as $i=>$n) {
+            $dir = $dirs[$i] ?? 'side-street';
+            $lines[] = "  - {$dir}: {$n['name']} ({$n['cuisine_type']}) ★".(int)($n['rating'] ?? 0);
+        }
+        if (!$neighbors) $lines[] = "  None. The alley is a dead end.";
+        return implode(PHP_EOL, $lines);
+    }
+
+    private function takeDamage(int $dmg, string $why): void {
+        $this->state['player']['hp'] = max(0, $this->state['player']['hp'] - $dmg);
+        $this->state['log'][] = "You take {$dmg} damage from $why.";
+        if ($this->state['player']['hp'] <= 0) {
+            $this->die("Perished by $why");
+        }
+    }
+
+    private function die(string $cause): void {
+        // Write a score and reset
+        $stmt = $this->db->pdo->prepare("INSERT INTO GAME_SCORES (player_name, depth, sauce_shards, cause_of_death, created_at) VALUES (:n,:d,:s,:c,:t)");
+        $stmt->execute([
+            ':n'=>$this->state['player']['name'],
+            ':d'=>$this->state['depth'],
+            ':s'=>$this->state['player']['sauce_shards'],
+            ':c'=>$cause,
+            ':t'=>Util::now()
+        ]);
+        $this->state['log'][] = "*** YOU DIED: {$cause} ***  (Permadeath active)";
+        $_SESSION['grave'] = $this->state; // keep last run for the death screen
+        unset($_SESSION['game']);
+        $this->state = [];
+    }
+
+    private function monsterAttack(): void {
+        $d = Util::dice(4) + $this->state['depth'] - 1;
+        $names = ['Grease Wraith','Microwave Lich','Sodium Slime','Delivery Goblin','Hangry Shade'];
+        $who = Util::pick($names);
+        $this->state['log'][] = "$who ambushes you!";
+        $this->takeDamage($d, $who);
+    }
+
+    private function hungerTick(): void {
+        $this->state['player']['hunger'] = min($this->state['player']['max_hunger'], $this->state['player']['hunger'] + 1);
+        if ($this->state['player']['hunger'] >= $this->state['player']['max_hunger']) {
+            $this->takeDamage(2, 'starvation');
+        }
+    }
+
+    public function look(): void {
+        if (!$this->state) return;
+        $rid = $this->state['pos'];
+        $r = $this->getRestaurantById((int)$rid);
+        $items = $this->menuItemsAt((int)$rid);
+        $this->state['log'][] = "You step into " . ($r['name'] ?? 'a nameless spot') . ".";
+        if ($items) {
+            $sample = array_slice($items, 0, min(3, count($items)));
+            $list = implode(', ', array_map(fn($i)=>$i['display_name'], $sample));
+            $this->state['log'][] = "On the chalkboard menu: " . $list . " ...and more.";
+        } else {
+            $this->state['log'][] = "Dusty menu. Nothing listed.";
+        }
+        $this->hungerTick();
+        if (Util::dice(6) <= 3) $this->monsterAttack();
+    }
+
+    public function move(string $dir): void {
+        if (!$this->state) return;
+        $rid = (int)$this->state['pos'];
+        $neighbors = $this->neighborsOf($rid);
+        $dirs = ['north','east','south','west'];
+        $index = array_search($dir, $dirs, true);
+        if ($index === false || !isset($neighbors[$index])) {
+            $this->state['log'][] = "You wander " . $dir . " but hit a dead end.";
+            $this->hungerTick();
+            if (Util::dice(6) <= 2) $this->monsterAttack();
+            return;
+        }
+        $next = $neighbors[$index];
+        $this->state['pos'] = (int)$next['id'];
+        $this->state['visited'][] = (int)$next['id'];
+        $this->state['depth']++;
+        $mood = $this->moodOfRestaurant((int)$next['id']);
+        $this->state['player']['sanity'] = Util::clamp(
+            $this->state['player']['sanity'] + $mood['power'],
+            0, $this->state['player']['max_sanity']
+        );
+        $this->state['log'][] = "You slip " . $dir . " to " . $next['name'] . " (" . $mood['name'] . ").";
+        $this->hungerTick();
+        if (Util::dice(6) <= 4) $this->monsterAttack(); // brutally hard
+    }
+
+    public function inventory(): void {
+        $inv = $this->state['player']['inventory'];
+        if (!$inv) $this->state['log'][] = "Inventory empty. The city laughs.";
+        else {
+            $list = [];
+            foreach ($inv as $k=>$item) $list[] = $item['name'] . " x" . $item['qty'];
+            $this->state['log'][] = "Backpack: " . implode(', ', $list);
+        }
+    }
+
+    public function scavenge(): void {
+        $rid = (int)$this->state['pos'];
+        $items = $this->menuItemsAt($rid);
+        if (!$items) { $this->state['log'][] = "No edible relics here."; $this->hungerTick(); return; }
+        $found = Util::pick($items);
+        $name = $found['display_name'];
+        $gain = Util::dice(2);
+        $this->state['player']['inventory'][] = ['name'=>$name, 'qty'=>$gain, 'type'=>'food'];
+        $this->state['log'][] = "You scavenge {$gain}x {$name}.";
+        if (Util::dice(6) <= 4) $this->monsterAttack();
+        $this->hungerTick();
+    }
+
+    public function eat(string $what = ''): void {
+        $inv =& $this->state['player']['inventory'];
+        if (!$inv) { $this->state['log'][] = "Nothing to eat."; return; }
+        $idx = null;
+        foreach ($inv as $i=>$it) {
+            if ($what && !Util::str_has_ci($it['name'], $what)) continue;
+            if ($it['type'] === 'food') { $idx = $i; break; }
+        }
+        if ($idx === null) { $this->state['log'][] = "You can't find that to eat."; return; }
+        $heal = Util::dice(3) - 1;
+        $this->state['player']['hunger'] = max(0, $this->state['player']['hunger'] - (2 + $heal));
+        $this->state['player']['hp'] = min($this->state['player']['max_hp'], $this->state['player']['hp'] + $heal);
+        $name = $inv[$idx]['name'];
+        if (--$inv[$idx]['qty'] <= 0) array_splice($inv, $idx, 1);
+        $this->state['log'][] = "You eat {$name}. (+{$heal} hp, hunger soothed)";
+        if (Util::dice(6) <= 3) $this->monsterAttack();
+    }
+
+    public function chant(): void {
+        // Attempt to bind sauce shard via order-recipe riddle
+        $rid = (int)$this->state['pos'];
+        $sql = "SELECT o.id as oid, SUM(oi.total_price) as sum_price, COUNT(*) as cnt
+                FROM ORDERS o
+                JOIN ORDER_ITEMS oi ON oi.order_id = o.id
+                JOIN MENU_ITEMS mi ON mi.id = oi.menu_item_id
+                WHERE mi.restaurant_id = :rid
+                GROUP BY o.id
+                ORDER BY RANDOM() LIMIT 1";
+        try {
+            $stmt = $this->db->pdo->prepare($sql);
+            $stmt->execute([':rid'=>$rid]);
+            $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+            if (!$row) { $this->state['log'][] = "Whispers fade. No receipts to decode."; return; }
+            $target = (int)round((float)$row['sum_price']);
+            // Brutal riddle: guess even/odd of target
+            $guess = Util::dice(2) === 1 ? 'even' : 'odd'; // hidden coin
+            if (($target % 2 === 0 && $guess === 'even') || ($target % 2 === 1 && $guess === 'odd')) {
+                // Player must counter-guess blindly -> tough
+                $this->state['log'][] = "A spectral receipt appears. It sums to ???. Speak 'solve even' or 'solve odd'.";
+                $this->state['pending_riddle'] = ['oid'=>$row['oid'], 'answer'=>($target%2===0?'even':'odd')];
+            } else {
+                $this->state['log'][] = "The recipe wards you off. Your brain sizzles.";
+                $this->takeDamage(2, 'psychic grease fire');
+            }
+        } catch (\Throwable $e) {
+            $this->state['log'][] = "You chant, but the bureaucracy of orders resists.";
+        }
+    }
+
+    public function solve(string $parity): void {
+        if (!isset($this->state['pending_riddle'])) { $this->state['log'][] = "No riddle is bound."; return; }
+        $ans = $this->state['pending_riddle']['answer'];
+        unset($this->state['pending_riddle']);
+        if (strtolower($parity) === strtolower($ans)) {
+            $gain = 1 + (int)floor($this->state['depth']/5);
+            $this->state['player']['sauce_shards'] += $gain;
+            $this->state['log'][] = "Your voice cuts the smog. You bind {$gain} Sauce Shard(s).";
+        } else {
+            $this->state['log'][] = "Your words curdle. The receipt detonates.";
+            $this->takeDamage(3, 'backfired receipt magic');
+        }
+    }
+
+    public function rest(): void {
+        $roll = Util::dice(6);
+        if ($roll <= 3) {
+            $this->state['log'][] = "You try to rest, but the nightlife finds you.";
+            $this->monsterAttack();
+        } else {
+            $heal = Util::dice(3);
+            $this->state['player']['hp'] = min($this->state['player']['max_hp'], $this->state['player']['hp'] + $heal);
+            $this->state['log'][] = "You steal {$heal} winks behind a dumpster.";
+        }
+        $this->hungerTick();
+    }
+
+    public function help(): string {
+        return implode(PHP_EOL, [
+            "Commands: look, map, go north|east|south|west, scavenge, eat [item],",
+            "          chant, solve even|odd, inv, rest, stats, help, new, quit",
+            "Goal: Bind Sauce Shards by decoding urban receipts. Permadeath. Good luck.",
+        ]);
+    }
+
+    public function stats(): string {
+        $p = $this->state['player'];
+        return "HP {$p['hp']}/{$p['max_hp']} | Hunger {$p['hunger']}/{$p['max_hunger']} | Sanity {$p['sanity']}/{$p['max_sanity']} | Shards {$p['sauce_shards']} | Depth {$this->state['depth']}";
+    }
+
+    public function process(string $cmd): void {
+        $cmd = trim($cmd);
+        if ($cmd === '') return;
+        $parts = preg_split('/\s+/', $cmd);
+        $verb = strtolower($parts[0]);
+        $arg = $parts[1] ?? '';
+
+        switch ($verb) {
+            case 'look': $this->look(); break;
+            case 'map': $this->state['log'][] = $this->renderMap(); break;
+            case 'go': $this->move(strtolower($arg)); break;
+            case 'scavenge': $this->scavenge(); break;
+            case 'eat': $this->eat($arg); break;
+            case 'chant': $this->chant(); break;
+            case 'solve': $this->solve($arg); break;
+            case 'inv': $this->inventory(); break;
+            case 'rest': $this->rest(); break;
+            case 'stats': $this->state['log'][] = $this->stats(); break;
+            case 'help': $this->state['log'][] = $this->help(); break;
+            case 'new': $this->newGame(); break;
+            case 'quit': $this->die('abandonment'); break;
+            default:
+                $this->state['log'][] = "Unknown incantation. Try 'help'.";
+        }
+        $this->save();
+    }
+}

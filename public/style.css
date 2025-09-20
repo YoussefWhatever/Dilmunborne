@@ -1,0 +1,18 @@
+*{box-sizing:border-box}body{margin:0;font-family:ui-monospace, Menlo, Consolas, monospace;background:#0b0c10;color:#c5c6c7}
+.wrap{max-width:980px;margin:0 auto;padding:16px}
+header{display:flex;flex-direction:column;gap:6px;margin-bottom:10px}
+h1{font-size:22px;margin:0;color:#66fcf1}
+.subtitle{margin:0;color:#45a29e}
+.hud{display:grid;grid-template-columns:1fr;gap:10px}
+.stats{background:#1f2833;padding:8px;border:1px solid #45a29e;border-radius:8px}
+.map{background:#1f2833;padding:8px;border:1px dashed #45a29e;border-radius:8px;max-height:320px;overflow:auto}
+.log{background:#0e161b;border:1px solid #1f2833;padding:10px;min-height:160px;border-radius:8px;max-height:360px;overflow:auto}
+.panel.death{background:#200;padding:12px;border:1px solid #844;border-radius:8px;margin-bottom:12px}
+.prompt{display:flex;flex-direction:column;gap:8px;margin-top:8px}
+input[type=text]{width:100%;padding:10px;border:1px solid #45a29e;border-radius:6px;background:#0b0c10;color:#c5c6c7}
+button{padding:10px 14px;border:1px solid #45a29e;background:#1f2833;color:#c5c6c7;border-radius:6px;cursor:pointer}
+button:hover{border-color:#66fcf1;color:#66fcf1}
+footer{margin-top:16px;font-size:12px;color:#7b8a8b}
+table{width:100%;border-collapse:collapse}
+td,th{border-bottom:1px solid #223;padding:6px;text-align:left}
+.tiny{opacity:.7}
